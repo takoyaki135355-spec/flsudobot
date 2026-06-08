@@ -1,8 +1,7 @@
 # Sudobot 
----
 **Current Version**
 V2.4.10
-
+---
 ## Capabilities
 
 - AI chatbot powered by Groq's Llama 3.3 70B model (hey sudobot <prompt> or mention the bot)
@@ -22,8 +21,7 @@ V2.4.10
 - Environment-variable configuration for secure token and ID management
 - Works across servers and DMs simultaneously
 - Built-in custom responses, inside jokes, and random yes/no decision making
-
-
+---
 ## Patch Notes
 
 2.4.10    Integrated Artificial Intellegence
