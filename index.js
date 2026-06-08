@@ -527,8 +527,8 @@ client.on("messageCreate", async (message) => {
     }
 
     if (content === "what is vihaan") {
-        await message.reply("DA DA DA DA MAX VERSTAPPEN!!!");
-        console.log(`[OUT → ${channelId}] DA DA DA DA MAX VERSTAPPEN!!!`);
+        await message.reply("DUH DUH DUH DA MAX VERSTAPPEN!!!");
+        console.log(`[OUT → ${channelId}] Duh Duh DA DA MAX VERSTAPPEN!!!`);
     }
 
     if (content === "what is deven") {
@@ -667,52 +667,89 @@ process.on("SIGINT", async () => {
 // Reaction handler for polls
 client.on("messageReactionAdd", async (reaction, user) => {
     try {
-        if (!reaction || !reaction.message) return;
-        if (!user || user.bot) return; // ignore bot reactions
+        if (!reaction) return;
+
+        // initial debug log
+        console.log(`[DEBUG] messageReactionAdd triggered; reaction.partial=${!!reaction.partial}, user=${user?.id}`);
+
+        // Fetch partials if needed
+        try {
+            if (reaction.partial && typeof reaction.fetch === 'function') await reaction.fetch();
+            if (reaction.message && reaction.message.partial && typeof reaction.message.fetch === 'function') await reaction.message.fetch();
+        } catch (e) {
+            console.warn('[DEBUG] partial fetch failed', e);
+        }
+
+        if (!reaction.message) {
+            console.log('[DEBUG] reaction has no message after fetch');
+            return;
+        }
+        if (!user || user.bot) {
+            console.log('[DEBUG] ignoring bot or missing user');
+            return; // ignore bot reactions
+        }
 
         const msgId = reaction.message.id;
+        console.log(`[DEBUG] reaction on message ${msgId}`);
+
         const poll = polls[msgId];
-        if (!poll) return; // not a tracked poll
-        if (poll.complete) return;
+        if (!poll) {
+            console.log(`[DEBUG] no poll tracked for message ${msgId}`);
+            return; // not a tracked poll
+        }
+        console.log(`[DEBUG] found poll for message ${msgId}`);
+        if (poll.complete) {
+            console.log('[DEBUG] poll already complete, ignoring reaction');
+            return;
+        }
 
-        const emoji = reaction.emoji && (reaction.emoji.name || reaction.emoji.id);
-        if (!emoji) return;
+        // Normalize emoji representations for matching
+        const emojiName = reaction.emoji && (reaction.emoji.name || (typeof reaction.emoji.toString === 'function' ? reaction.emoji.toString() : reaction.emoji.id));
+        const emojiToString = (reaction.emoji && typeof reaction.emoji.toString === 'function') ? reaction.emoji.toString() : emojiName;
+        console.log(`[DEBUG] reaction emojiName=${emojiName}, emojiToString=${emojiToString}`);
 
-        // Only consider reactions that are part of the poll's emoji mapping
-        if (!poll.emojiMap.includes(emoji)) return;
+        // Find option index by matching known representations
+        const idx = poll.emojiMap.findIndex(em => em === emojiName || em === emojiToString);
+        console.log(`[DEBUG] matched option index = ${idx}`);
+        if (idx < 0) {
+            console.log('[DEBUG] reaction emoji not part of poll options');
+            return; // reaction not part of poll options
+        }
 
-        // If user already voted, ignore and remove the extra reaction if possible
-        if (poll.votes[user.id]) {
+        // If user already voted, remove this extra reaction if possible and ignore
+        if (poll.votes[user.id] !== undefined) {
+            console.log(`[DEBUG] user ${user.id} already voted for option ${poll.votes[user.id]}; removing extra reaction`);
             try {
-                // attempt to remove the user's new reaction to enforce single-vote
                 if (reaction.users && typeof reaction.users.remove === 'function') {
                     await reaction.users.remove(user.id);
                 } else if (typeof reaction.remove === 'function') {
                     await reaction.remove();
                 }
             } catch (e) {
-                // ignore removal errors
+                console.warn('[DEBUG] failed to remove extra reaction', e);
             }
             return;
         }
 
-        // Record the user's vote
-        poll.votes[user.id] = emoji;
+        // Record the user's vote as the option index
+        poll.votes[user.id] = idx;
+        console.log(`[DEBUG] recorded vote: user=${user.id} -> optionIndex=${idx}`);
 
         // Count unique voters
         const uniqueVoters = Object.keys(poll.votes).length;
+        console.log(`[DEBUG] uniqueVoters=${uniqueVoters} minVotes=${poll.minVotes}`);
 
         // If we reached required votes, compute and post results
         if (uniqueVoters >= poll.minVotes) {
-            // Tally votes for each option
+            console.log('[DEBUG] threshold reached, tallying results');
             const counts = new Array(poll.options.length).fill(0);
             const votersByOption = new Array(poll.options.length).fill(null).map(() => []);
 
-            for (const [uid, e] of Object.entries(poll.votes)) {
-                const idx = poll.emojiMap.indexOf(e);
-                if (idx >= 0) {
-                    counts[idx]++;
-                    votersByOption[idx].push(uid);
+            for (const [uid, optIdx] of Object.entries(poll.votes)) {
+                const i = Number(optIdx);
+                if (!Number.isNaN(i) && i >= 0 && i < counts.length) {
+                    counts[i]++;
+                    votersByOption[i].push(uid);
                 }
             }
 
@@ -739,17 +776,17 @@ client.on("messageReactionAdd", async (reaction, user) => {
                 resultText += `Tie between: ${tiedOptions} with ${maxVotes} vote(s) each.`;
             }
 
+            console.log('[DEBUG] posting poll result message');
             // Post result and mark poll complete (leave original poll message unchanged)
             try {
                 const channel = await client.channels.fetch(poll.channelId);
                 if (channel) await channel.send(resultText);
+                else await reaction.message.channel.send(resultText);
             } catch (e) {
-                // fallback: try to use reaction.message.channel
                 try { await reaction.message.channel.send(resultText); } catch (ee) { console.error('Failed posting poll result:', ee); }
             }
 
             poll.complete = true;
-            // Optionally remove poll from memory
             delete polls[msgId];
         }
     } catch (err) {
