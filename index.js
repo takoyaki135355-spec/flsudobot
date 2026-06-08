@@ -17,6 +17,9 @@ let megaphoneTarget = null;
 // Echo state
 let echoActive = false;
 
+// In-memory poll storage: messageId -> pollState
+const polls = {};
+
 const HW_FILE = path.join(process.cwd(), "hwlist.json");
 
 function readHW() {
@@ -426,6 +429,88 @@ client.on("messageCreate", async (message) => {
         console.log(`[OUT → ${channelId}] Pong!`);
     }
 
+    // Poll command: !poll <min-votes> "<question>" <option1> ... <option9>
+    if (content.startsWith("!poll ")) {
+        // Require quoted question to reliably parse options
+        const m = content.match(/^!poll\s+(\d+)\s+"([^"]+)"\s+([\s\S]+)$/);
+        if (!m) {
+            const replyText = 'Usage: !poll <min-votes> "<question>" <option1> <option2> ... (up to 9 options)';
+            await message.reply(replyText);
+            console.log(`[OUT → ${channelId}] ${replyText}`);
+            return;
+        }
+
+        const minVotes = parseInt(m[1], 10);
+        const question = m[2].trim();
+        const optionsRaw = m[3].trim();
+
+        // Split options by whitespace, but allow options with spaces if wrapped in quotes
+        // We'll support both unquoted single-word options and quoted multi-word options
+        const optionMatches = [];
+        const optRe = /"([^"]+)"|(\S+)/g;
+        let om;
+        while ((om = optRe.exec(optionsRaw)) !== null) {
+            optionMatches.push(om[1] ?? om[2]);
+        }
+
+        if (optionMatches.length < 2) {
+            const replyText = "Please provide at least 2 options for the poll.";
+            await message.reply(replyText);
+            console.log(`[OUT → ${channelId}] ${replyText}`);
+            return;
+        }
+
+        if (optionMatches.length > 9) {
+            const replyText = "A poll can have at most 9 options. Please reduce the number of options.";
+            await message.reply(replyText);
+            console.log(`[OUT → ${channelId}] ${replyText}`);
+            return;
+        }
+
+        const emojiMap = [
+            '1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣'
+        ];
+
+        const options = optionMatches;
+
+        // Build poll message
+        let pollText = `**Poll:** ${question}\n\n`;
+        for (let i = 0; i < options.length; i++) {
+            pollText += `${emojiMap[i]}  ${options[i]}\n`;
+        }
+        pollText += `\nMinimum unique votes required: ${minVotes}`;
+
+        try {
+            const pollMessage = await message.channel.send(pollText);
+
+            // Add number reactions corresponding to options
+            for (let i = 0; i < options.length; i++) {
+                try { await pollMessage.react(emojiMap[i]); } catch (e) { /* ignore reaction errors */ }
+            }
+
+            // Store poll state
+            polls[pollMessage.id] = {
+                messageId: pollMessage.id,
+                channelId: pollMessage.channel.id || channelId,
+                question,
+                options,
+                emojiMap: emojiMap.slice(0, options.length),
+                minVotes,
+                votes: {}, // userId -> emoji
+                complete: false,
+            };
+
+            const replyText = `Poll posted with ${options.length} options. Voting via reactions.`;
+            await message.reply(replyText);
+            console.log(`[OUT → ${channelId}] ${replyText}`);
+        } catch (err) {
+            console.error('Failed to post poll:', err);
+            await message.reply('Failed to create poll: ' + (err?.message || String(err)));
+        }
+
+        return;
+    }
+
     if (content === "hi sudobot") {
         await message.reply("Hello!");
         console.log(`[OUT → ${channelId}] Hello!`);
@@ -577,6 +662,99 @@ process.on("SIGINT", async () => {
     }
     await client.destroy();
     process.exit(0);
+});
+
+// Reaction handler for polls
+client.on("messageReactionAdd", async (reaction, user) => {
+    try {
+        if (!reaction || !reaction.message) return;
+        if (!user || user.bot) return; // ignore bot reactions
+
+        const msgId = reaction.message.id;
+        const poll = polls[msgId];
+        if (!poll) return; // not a tracked poll
+        if (poll.complete) return;
+
+        const emoji = reaction.emoji && (reaction.emoji.name || reaction.emoji.id);
+        if (!emoji) return;
+
+        // Only consider reactions that are part of the poll's emoji mapping
+        if (!poll.emojiMap.includes(emoji)) return;
+
+        // If user already voted, ignore and remove the extra reaction if possible
+        if (poll.votes[user.id]) {
+            try {
+                // attempt to remove the user's new reaction to enforce single-vote
+                if (reaction.users && typeof reaction.users.remove === 'function') {
+                    await reaction.users.remove(user.id);
+                } else if (typeof reaction.remove === 'function') {
+                    await reaction.remove();
+                }
+            } catch (e) {
+                // ignore removal errors
+            }
+            return;
+        }
+
+        // Record the user's vote
+        poll.votes[user.id] = emoji;
+
+        // Count unique voters
+        const uniqueVoters = Object.keys(poll.votes).length;
+
+        // If we reached required votes, compute and post results
+        if (uniqueVoters >= poll.minVotes) {
+            // Tally votes for each option
+            const counts = new Array(poll.options.length).fill(0);
+            const votersByOption = new Array(poll.options.length).fill(null).map(() => []);
+
+            for (const [uid, e] of Object.entries(poll.votes)) {
+                const idx = poll.emojiMap.indexOf(e);
+                if (idx >= 0) {
+                    counts[idx]++;
+                    votersByOption[idx].push(uid);
+                }
+            }
+
+            // Build result message
+            let resultText = `**Poll Results:** ${poll.question}\n\n`;
+            for (let i = 0; i < poll.options.length; i++) {
+                const emojiLabel = poll.emojiMap[i];
+                const optText = poll.options[i];
+                const voterMentions = votersByOption[i].map(id => `<@${id}>`).join(', ') || 'None';
+                resultText += `${emojiLabel}  **${optText}** — ${counts[i]} vote(s)\nVoters: ${voterMentions}\n\n`;
+            }
+
+            // Determine winner or tie
+            const maxVotes = Math.max(...counts);
+            const winners = [];
+            for (let i = 0; i < counts.length; i++) if (counts[i] === maxVotes) winners.push(i);
+
+            if (maxVotes === 0) {
+                resultText += 'No votes were cast.';
+            } else if (winners.length === 1) {
+                resultText += `Winner: **${poll.options[winners[0]]}** with ${maxVotes} vote(s).`;
+            } else {
+                const tiedOptions = winners.map(i => `**${poll.options[i]}**`).join(', ');
+                resultText += `Tie between: ${tiedOptions} with ${maxVotes} vote(s) each.`;
+            }
+
+            // Post result and mark poll complete (leave original poll message unchanged)
+            try {
+                const channel = await client.channels.fetch(poll.channelId);
+                if (channel) await channel.send(resultText);
+            } catch (e) {
+                // fallback: try to use reaction.message.channel
+                try { await reaction.message.channel.send(resultText); } catch (ee) { console.error('Failed posting poll result:', ee); }
+            }
+
+            poll.complete = true;
+            // Optionally remove poll from memory
+            delete polls[msgId];
+        }
+    } catch (err) {
+        console.error('Error in messageReactionAdd handler:', err);
+    }
 });
 
 client.login(process.env.FLUXER_BOT_TOKEN);

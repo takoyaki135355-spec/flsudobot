@@ -1,6 +1,6 @@
 # Sudobot 
 **Current Version**
-V2.4.10
+V2.5.0
 ---
 ## Capabilities
 
@@ -21,7 +21,9 @@ V2.4.10
 - Environment-variable configuration for secure token and ID management
 - Works across servers and DMs simultaneously
 - Built-in custom responses, inside jokes, and random yes/no decision making
+- Poll Functionality via reactions, limiting reactions/user to 1
 ---
 ## Patch Notes
 
-2.4.10    Integrated Artificial Intellegence
+2.5.0   Integrated Poll Feature
+2.4.10  Integrated Artificial Intellegence
