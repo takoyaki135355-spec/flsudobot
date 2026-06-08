@@ -4,7 +4,11 @@ import fs from "fs";
 import path from "path";
 
 const client = new Client({
-    token: process.env.FLUXER_BOT_TOKEN
+    token: process.env.FLUXER_BOT_TOKEN,
+    // Request intents and partials so reaction events and uncached messages are available.
+    // `intents` number is a broad mask to include message and reaction events; adjust if you prefer explicit flags.
+    intents: 32767,
+    partials: ["MESSAGE", "CHANNEL", "REACTION"],
 });
 
 let logChannel = null;
@@ -19,6 +23,68 @@ let echoActive = false;
 
 // In-memory poll storage: messageId -> pollState
 const polls = {};
+
+// Minimal local ReactionCollector for Fluxer - scoped per-message
+class ReactionCollector {
+    constructor(message, options = {}) {
+        this.message = message;
+        this.filter = options.filter || (() => true);
+        this.max = options.max ?? Infinity;
+        this.time = options.time ?? 0;
+        this.collected = new Map(); // userId -> emoji
+        this._events = {};
+        this._onReaction = this._onReaction.bind(this);
+        client.on('messageReactionAdd', this._onReaction);
+        if (this.time > 0) this._timeout = setTimeout(() => this.stop('time'), this.time);
+    }
+
+    async _onReaction(reaction, user) {
+        try {
+            if (!reaction) return;
+            if (!user || user.bot) return;
+            // fetch partials if necessary
+            if (reaction.partial && typeof reaction.fetch === 'function') await reaction.fetch();
+            if (reaction.message && reaction.message.partial && typeof reaction.message.fetch === 'function') await reaction.message.fetch();
+        } catch (e) {
+            // ignore
+        }
+
+        if (!reaction || !reaction.message) return;
+        if (reaction.message.id !== this.message.id) return;
+        if (!this.filter(reaction, user)) return;
+
+        const emoji = reaction.emoji && (reaction.emoji.name || (typeof reaction.emoji.toString === 'function' ? reaction.emoji.toString() : reaction.emoji.id));
+
+        if (this.collected.has(user.id)) {
+            // try remove extra reaction to enforce single-vote
+            try {
+                if (reaction.users && typeof reaction.users.remove === 'function') await reaction.users.remove(user.id);
+                else if (typeof reaction.remove === 'function') await reaction.remove();
+            } catch (e) {}
+            return;
+        }
+
+        this.collected.set(user.id, emoji);
+        this.emit('collect', reaction, user);
+
+        if (this.collected.size >= this.max) this.stop('limit');
+    }
+
+    stop(reason = 'manual') {
+        client.off('messageReactionAdd', this._onReaction);
+        if (this._timeout) clearTimeout(this._timeout);
+        this.emit('end', this.collected, reason);
+    }
+
+    on(event, fn) {
+        this._events[event] = this._events[event] || [];
+        this._events[event].push(fn);
+    }
+
+    emit(event, ...args) {
+        (this._events[event] || []).forEach(fn => { try { fn(...args); } catch (e) { console.error(e); } });
+    }
+}
 
 const HW_FILE = path.join(process.cwd(), "hwlist.json");
 
@@ -489,16 +555,91 @@ client.on("messageCreate", async (message) => {
             }
 
             // Store poll state
-            polls[pollMessage.id] = {
+            const pollState = {
                 messageId: pollMessage.id,
                 channelId: pollMessage.channel.id || channelId,
                 question,
                 options,
                 emojiMap: emojiMap.slice(0, options.length),
                 minVotes,
-                votes: {}, // userId -> emoji
+                votes: {}, // userId -> emojiIndex
                 complete: false,
             };
+            polls[pollMessage.id] = pollState;
+
+            // Create a ReactionCollector scoped to this poll which stops when minVotes unique voters collected
+            const collector = new ReactionCollector(pollMessage, {
+                filter: (reaction, user) => {
+                    try {
+                        if (!reaction || !reaction.emoji) return false;
+                        const rep = reaction.emoji.name || (reaction.emoji.toString && reaction.emoji.toString());
+                        return !!rep && pollState.emojiMap.includes(rep) && !user?.bot;
+                    } catch (e) { return false; }
+                },
+                max: minVotes,
+            });
+
+            collector.on('collect', (reaction, user) => {
+                try {
+                    const rep = reaction.emoji.name || (reaction.emoji.toString && reaction.emoji.toString());
+                    const idx = pollState.emojiMap.indexOf(rep);
+                    if (idx >= 0 && !pollState.votes[user.id]) {
+                        pollState.votes[user.id] = idx;
+                        console.log(`[DEBUG] collector recorded vote: poll=${pollMessage.id} user=${user.id} idx=${idx}`);
+                    }
+                } catch (e) { console.warn('collector collect handler error', e); }
+            });
+
+            collector.on('end', async (collected, reason) => {
+                try {
+                    // Tally from collector.collected (Map)
+                    const counts = new Array(pollState.options.length).fill(0);
+                    const votersByOption = new Array(pollState.options.length).fill(null).map(() => []);
+
+                    for (const [uid, emojiRep] of collected.entries()) {
+                        const idx = pollState.emojiMap.indexOf(emojiRep);
+                        if (idx >= 0) {
+                            counts[idx]++;
+                            votersByOption[idx].push(uid);
+                        }
+                    }
+
+                    // Build result message
+                    let resultText = `**Poll Results:** ${pollState.question}\n\n`;
+                    for (let i = 0; i < pollState.options.length; i++) {
+                        const emojiLabel = pollState.emojiMap[i];
+                        const optText = pollState.options[i];
+                        const voterMentions = votersByOption[i].map(id => `<@${id}>`).join(', ') || 'None';
+                        resultText += `${emojiLabel}  **${optText}** — ${counts[i]} vote(s)\nVoters: ${voterMentions}\n\n`;
+                    }
+
+                    const maxVotes = Math.max(...counts);
+                    const winners = [];
+                    for (let i = 0; i < counts.length; i++) if (counts[i] === maxVotes) winners.push(i);
+
+                    if (maxVotes === 0) {
+                        resultText += 'No votes were cast.';
+                    } else if (winners.length === 1) {
+                        resultText += `Winner: **${pollState.options[winners[0]]}** with ${maxVotes} vote(s).`;
+                    } else {
+                        const tiedOptions = winners.map(i => `**${pollState.options[i]}**`).join(', ');
+                        resultText += `Tie between: ${tiedOptions} with ${maxVotes} vote(s) each.`;
+                    }
+
+                    try {
+                        const channel = await client.channels.fetch(pollState.channelId);
+                        if (channel) await channel.send(resultText);
+                        else await pollMessage.channel.send(resultText);
+                    } catch (e) {
+                        try { await pollMessage.channel.send(resultText); } catch (ee) { console.error('Failed posting poll result:', ee); }
+                    }
+
+                    pollState.complete = true;
+                    delete polls[pollMessage.id];
+                } catch (e) {
+                    console.error('Error finalizing poll:', e);
+                }
+            });
 
             const replyText = `Poll posted with ${options.length} options. Voting via reactions.`;
             await message.reply(replyText);
@@ -664,134 +805,6 @@ process.on("SIGINT", async () => {
     process.exit(0);
 });
 
-// Reaction handler for polls
-client.on("messageReactionAdd", async (reaction, user) => {
-    try {
-        if (!reaction) return;
-
-        // initial debug log
-        console.log(`[DEBUG] messageReactionAdd triggered; reaction.partial=${!!reaction.partial}, user=${user?.id}`);
-
-        // Fetch partials if needed
-        try {
-            if (reaction.partial && typeof reaction.fetch === 'function') await reaction.fetch();
-            if (reaction.message && reaction.message.partial && typeof reaction.message.fetch === 'function') await reaction.message.fetch();
-        } catch (e) {
-            console.warn('[DEBUG] partial fetch failed', e);
-        }
-
-        if (!reaction.message) {
-            console.log('[DEBUG] reaction has no message after fetch');
-            return;
-        }
-        if (!user || user.bot) {
-            console.log('[DEBUG] ignoring bot or missing user');
-            return; // ignore bot reactions
-        }
-
-        const msgId = reaction.message.id;
-        console.log(`[DEBUG] reaction on message ${msgId}`);
-
-        const poll = polls[msgId];
-        if (!poll) {
-            console.log(`[DEBUG] no poll tracked for message ${msgId}`);
-            return; // not a tracked poll
-        }
-        console.log(`[DEBUG] found poll for message ${msgId}`);
-        if (poll.complete) {
-            console.log('[DEBUG] poll already complete, ignoring reaction');
-            return;
-        }
-
-        // Normalize emoji representations for matching
-        const emojiName = reaction.emoji && (reaction.emoji.name || (typeof reaction.emoji.toString === 'function' ? reaction.emoji.toString() : reaction.emoji.id));
-        const emojiToString = (reaction.emoji && typeof reaction.emoji.toString === 'function') ? reaction.emoji.toString() : emojiName;
-        console.log(`[DEBUG] reaction emojiName=${emojiName}, emojiToString=${emojiToString}`);
-
-        // Find option index by matching known representations
-        const idx = poll.emojiMap.findIndex(em => em === emojiName || em === emojiToString);
-        console.log(`[DEBUG] matched option index = ${idx}`);
-        if (idx < 0) {
-            console.log('[DEBUG] reaction emoji not part of poll options');
-            return; // reaction not part of poll options
-        }
-
-        // If user already voted, remove this extra reaction if possible and ignore
-        if (poll.votes[user.id] !== undefined) {
-            console.log(`[DEBUG] user ${user.id} already voted for option ${poll.votes[user.id]}; removing extra reaction`);
-            try {
-                if (reaction.users && typeof reaction.users.remove === 'function') {
-                    await reaction.users.remove(user.id);
-                } else if (typeof reaction.remove === 'function') {
-                    await reaction.remove();
-                }
-            } catch (e) {
-                console.warn('[DEBUG] failed to remove extra reaction', e);
-            }
-            return;
-        }
-
-        // Record the user's vote as the option index
-        poll.votes[user.id] = idx;
-        console.log(`[DEBUG] recorded vote: user=${user.id} -> optionIndex=${idx}`);
-
-        // Count unique voters
-        const uniqueVoters = Object.keys(poll.votes).length;
-        console.log(`[DEBUG] uniqueVoters=${uniqueVoters} minVotes=${poll.minVotes}`);
-
-        // If we reached required votes, compute and post results
-        if (uniqueVoters >= poll.minVotes) {
-            console.log('[DEBUG] threshold reached, tallying results');
-            const counts = new Array(poll.options.length).fill(0);
-            const votersByOption = new Array(poll.options.length).fill(null).map(() => []);
-
-            for (const [uid, optIdx] of Object.entries(poll.votes)) {
-                const i = Number(optIdx);
-                if (!Number.isNaN(i) && i >= 0 && i < counts.length) {
-                    counts[i]++;
-                    votersByOption[i].push(uid);
-                }
-            }
-
-            // Build result message
-            let resultText = `**Poll Results:** ${poll.question}\n\n`;
-            for (let i = 0; i < poll.options.length; i++) {
-                const emojiLabel = poll.emojiMap[i];
-                const optText = poll.options[i];
-                const voterMentions = votersByOption[i].map(id => `<@${id}>`).join(', ') || 'None';
-                resultText += `${emojiLabel}  **${optText}** — ${counts[i]} vote(s)\nVoters: ${voterMentions}\n\n`;
-            }
-
-            // Determine winner or tie
-            const maxVotes = Math.max(...counts);
-            const winners = [];
-            for (let i = 0; i < counts.length; i++) if (counts[i] === maxVotes) winners.push(i);
-
-            if (maxVotes === 0) {
-                resultText += 'No votes were cast.';
-            } else if (winners.length === 1) {
-                resultText += `Winner: **${poll.options[winners[0]]}** with ${maxVotes} vote(s).`;
-            } else {
-                const tiedOptions = winners.map(i => `**${poll.options[i]}**`).join(', ');
-                resultText += `Tie between: ${tiedOptions} with ${maxVotes} vote(s) each.`;
-            }
-
-            console.log('[DEBUG] posting poll result message');
-            // Post result and mark poll complete (leave original poll message unchanged)
-            try {
-                const channel = await client.channels.fetch(poll.channelId);
-                if (channel) await channel.send(resultText);
-                else await reaction.message.channel.send(resultText);
-            } catch (e) {
-                try { await reaction.message.channel.send(resultText); } catch (ee) { console.error('Failed posting poll result:', ee); }
-            }
-
-            poll.complete = true;
-            delete polls[msgId];
-        }
-    } catch (err) {
-        console.error('Error in messageReactionAdd handler:', err);
-    }
-});
+// (Per-poll collectors are used instead of a global `messageReactionAdd` handler.)
 
 client.login(process.env.FLUXER_BOT_TOKEN);
