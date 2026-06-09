@@ -21,7 +21,13 @@ V2.5.0
 - Environment-variable configuration for secure token and ID management
 - Works across servers and DMs simultaneously
 - Built-in custom responses, inside jokes, and random yes/no decision making
+
+## Currently Building
+
 - Poll Functionality via reactions, limiting reactions/user to 1
+- List all polls for debug
+- Force tally a message by msgid
+
 ---
 ## Patch Notes:
 

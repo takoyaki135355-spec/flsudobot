@@ -658,8 +658,7 @@ client.on("messageCreate", async (message) => {
     if (content.startsWith("!tally ")) {
         const arg = content.slice(7).trim();
         if (!arg) {
-            const replyText = "Usage: !tally <pollMessageId>";
-            await message.reply(replyText);
+            await message.reply("Usage: !tally <pollMessageId>");
             return;
         }
 
@@ -674,19 +673,76 @@ client.on("messageCreate", async (message) => {
             return;
         }
 
+        const computeAndPost = async (counts, votersByOption) => {
+            try {
+                let resultText = `**Poll Results:** ${poll.question}\n\n`;
+                for (let i = 0; i < poll.options.length; i++) {
+                    const emojiLabel = poll.emojiMap[i];
+                    const optText = poll.options[i];
+                    const voterMentions = (votersByOption[i] || []).map(id => `<@${id}>`).join(', ') || 'None';
+                    resultText += `${emojiLabel}  **${optText}** — ${counts[i] || 0} vote(s)\nVoters: ${voterMentions}\n\n`;
+                }
+
+                const maxVotes = Math.max(...counts);
+                const winners = [];
+                for (let i = 0; i < counts.length; i++) if (counts[i] === maxVotes) winners.push(i);
+
+                if (maxVotes === 0) {
+                    resultText += 'No votes were cast.';
+                } else if (winners.length === 1) {
+                    resultText += `Winner: **${poll.options[winners[0]]}** with ${maxVotes} vote(s).`;
+                } else {
+                    const tiedOptions = winners.map(i => `**${poll.options[i]}**`).join(', ');
+                    resultText += `Tie between: ${tiedOptions} with ${maxVotes} vote(s) each.`;
+                }
+
+                try {
+                    const channel = await client.channels.fetch(poll.channelId);
+                    if (channel) await channel.send(resultText);
+                    else await message.channel.send(resultText);
+                } catch (e) {
+                    try { await message.channel.send(resultText); } catch (ee) { console.error('Failed posting forced tally:', ee); }
+                }
+            } catch (e) {
+                console.error('computeAndPost error:', e);
+            }
+        };
+
         try {
-            // If a collector exists, stop it to finalize collected votes
-            if (poll.collector && typeof poll.collector.stop === 'function') {
-                poll.collector.stop('forced');
-                // collector's 'end' handler will post results and delete poll
+            if (poll.collector) {
+                // Wait for collector to finish after we stop it, using a one-time listener
+                await new Promise((resolve) => {
+                    const onEnd = (collected) => {
+                        try {
+                            // build counts/voters from collected Map of userId->emojiRep
+                            const counts = new Array(poll.options.length).fill(0);
+                            const votersByOption = new Array(poll.options.length).fill(null).map(() => []);
+                            for (const [uid, emojiRep] of collected.entries()) {
+                                const idx = poll.emojiMap.indexOf(emojiRep);
+                                if (idx >= 0) {
+                                    counts[idx]++;
+                                    votersByOption[idx].push(uid);
+                                }
+                            }
+                            // mark complete and clean up
+                            poll.complete = true;
+                            delete polls[arg];
+                            computeAndPost(counts, votersByOption).then(() => resolve());
+                        } catch (e) { console.error('onEnd error:', e); resolve(); }
+                    };
+
+                    poll.collector.on('end', onEnd);
+                    // stop collector (will trigger 'end' listener)
+                    try { poll.collector.stop('forced'); } catch (e) { console.warn('collector.stop failed', e); resolve(); }
+                });
+
                 await message.reply('Tally forced — finalizing poll.');
                 return;
             }
 
-            // Fallback: compute from current poll.votes map
+            // No collector: use poll.votes (expected userId -> optionIndex)
             const counts = new Array(poll.options.length).fill(0);
             const votersByOption = new Array(poll.options.length).fill(null).map(() => []);
-
             for (const [uid, optIdx] of Object.entries(poll.votes || {})) {
                 const i = Number(optIdx);
                 if (!Number.isNaN(i) && i >= 0 && i < counts.length) {
@@ -695,42 +751,44 @@ client.on("messageCreate", async (message) => {
                 }
             }
 
-            let resultText = `**Poll Results:** ${poll.question}\n\n`;
-            for (let i = 0; i < poll.options.length; i++) {
-                const emojiLabel = poll.emojiMap[i];
-                const optText = poll.options[i];
-                const voterMentions = votersByOption[i].map(id => `<@${id}>`).join(', ') || 'None';
-                resultText += `${emojiLabel}  **${optText}** — ${counts[i]} vote(s)\nVoters: ${voterMentions}\n\n`;
-            }
-
-            const maxVotes = Math.max(...counts);
-            const winners = [];
-            for (let i = 0; i < counts.length; i++) if (counts[i] === maxVotes) winners.push(i);
-
-            if (maxVotes === 0) {
-                resultText += 'No votes were cast.';
-            } else if (winners.length === 1) {
-                resultText += `Winner: **${poll.options[winners[0]]}** with ${maxVotes} vote(s).`;
-            } else {
-                const tiedOptions = winners.map(i => `**${poll.options[i]}**`).join(', ');
-                resultText += `Tie between: ${tiedOptions} with ${maxVotes} vote(s) each.`;
-            }
-
-            try {
-                const channel = await client.channels.fetch(poll.channelId);
-                if (channel) await channel.send(resultText);
-                else await message.channel.send(resultText);
-            } catch (e) {
-                try { await message.channel.send(resultText); } catch (ee) { console.error('Failed posting forced tally:', ee); }
-            }
-
+            // mark complete and cleanup
             poll.complete = true;
             delete polls[arg];
+
+            await computeAndPost(counts, votersByOption);
+            await message.reply('Tally complete.');
+            return;
         } catch (err) {
             console.error('Error during forced tally:', err);
             await message.reply('Error during forced tally: ' + (err?.message || String(err)));
+            return;
+        }
+    }
+
+    // Owner-only: list active polls
+    if (content === "!polls") {
+        if (message.author.id !== process.env.OWNER_ID) {
+            await message.reply("Only the owner can list active polls.");
+            return;
         }
 
+        const ids = Object.keys(polls);
+        if (ids.length === 0) {
+            await message.reply("No active polls.");
+            return;
+        }
+
+        const lines = [];
+        for (const id of ids) {
+            const p = polls[id];
+            const voters = p.votes ? Object.keys(p.votes).length : (p.collector ? p.collector.collected.size : 0);
+            const channelLabel = p.channelId ? `<#${p.channelId}>` : 'Unknown';
+            lines.push(`ID: ${id} | Channel: ${channelLabel} | Q: ${p.question} | minVotes: ${p.minVotes} | voters: ${voters}`);
+        }
+
+        // Send in chunks if long
+        const chunk = lines.join('\n');
+        await message.reply(`**Active Polls:**\n${chunk}`);
         return;
     }
 
@@ -751,7 +809,7 @@ client.on("messageCreate", async (message) => {
 
     if (content === "what is vihaan") {
         await message.reply("DUH DUH DUH DA MAX VERSTAPPEN!!!");
-        console.log(`[OUT → ${channelId}] Duh Duh DA DA MAX VERSTAPPEN!!!`);
+        console.log(`[OUT → ${channelId}] Duh Duh D DA MAX VERSTAPPEN!!!`);
     }
 
     if (content === "what is deven") {
