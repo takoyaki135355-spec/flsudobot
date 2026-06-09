@@ -590,6 +590,8 @@ client.on("messageCreate", async (message) => {
                 } catch (e) { console.warn('collector collect handler error', e); }
             });
 
+            pollState.collector = collector;
+
             collector.on('end', async (collected, reason) => {
                 try {
                     // Tally from collector.collected (Map)
@@ -647,6 +649,86 @@ client.on("messageCreate", async (message) => {
         } catch (err) {
             console.error('Failed to post poll:', err);
             await message.reply('Failed to create poll: ' + (err?.message || String(err)));
+        }
+
+        return;
+    }
+
+    // Force-tally command for debugging: owner-only
+    if (content.startsWith("!tally ")) {
+        const arg = content.slice(7).trim();
+        if (!arg) {
+            const replyText = "Usage: !tally <pollMessageId>";
+            await message.reply(replyText);
+            return;
+        }
+
+        if (message.author.id !== process.env.OWNER_ID) {
+            await message.reply("Only the owner can force-tally polls.");
+            return;
+        }
+
+        const poll = polls[arg];
+        if (!poll) {
+            await message.reply(`No active poll found with message ID ${arg}.`);
+            return;
+        }
+
+        try {
+            // If a collector exists, stop it to finalize collected votes
+            if (poll.collector && typeof poll.collector.stop === 'function') {
+                poll.collector.stop('forced');
+                // collector's 'end' handler will post results and delete poll
+                await message.reply('Tally forced — finalizing poll.');
+                return;
+            }
+
+            // Fallback: compute from current poll.votes map
+            const counts = new Array(poll.options.length).fill(0);
+            const votersByOption = new Array(poll.options.length).fill(null).map(() => []);
+
+            for (const [uid, optIdx] of Object.entries(poll.votes || {})) {
+                const i = Number(optIdx);
+                if (!Number.isNaN(i) && i >= 0 && i < counts.length) {
+                    counts[i]++;
+                    votersByOption[i].push(uid);
+                }
+            }
+
+            let resultText = `**Poll Results:** ${poll.question}\n\n`;
+            for (let i = 0; i < poll.options.length; i++) {
+                const emojiLabel = poll.emojiMap[i];
+                const optText = poll.options[i];
+                const voterMentions = votersByOption[i].map(id => `<@${id}>`).join(', ') || 'None';
+                resultText += `${emojiLabel}  **${optText}** — ${counts[i]} vote(s)\nVoters: ${voterMentions}\n\n`;
+            }
+
+            const maxVotes = Math.max(...counts);
+            const winners = [];
+            for (let i = 0; i < counts.length; i++) if (counts[i] === maxVotes) winners.push(i);
+
+            if (maxVotes === 0) {
+                resultText += 'No votes were cast.';
+            } else if (winners.length === 1) {
+                resultText += `Winner: **${poll.options[winners[0]]}** with ${maxVotes} vote(s).`;
+            } else {
+                const tiedOptions = winners.map(i => `**${poll.options[i]}**`).join(', ');
+                resultText += `Tie between: ${tiedOptions} with ${maxVotes} vote(s) each.`;
+            }
+
+            try {
+                const channel = await client.channels.fetch(poll.channelId);
+                if (channel) await channel.send(resultText);
+                else await message.channel.send(resultText);
+            } catch (e) {
+                try { await message.channel.send(resultText); } catch (ee) { console.error('Failed posting forced tally:', ee); }
+            }
+
+            poll.complete = true;
+            delete polls[arg];
+        } catch (err) {
+            console.error('Error during forced tally:', err);
+            await message.reply('Error during forced tally: ' + (err?.message || String(err)));
         }
 
         return;
