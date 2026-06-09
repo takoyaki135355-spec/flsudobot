@@ -23,7 +23,7 @@ V2.5.0
 - Built-in custom responses, inside jokes, and random yes/no decision making
 - Poll Functionality via reactions, limiting reactions/user to 1
 ---
-## Patch Notes
+## Patch Notes:
 
 2.5.0   Integrated Poll Feature
 
