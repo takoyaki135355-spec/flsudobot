@@ -5,10 +5,6 @@ import path from "path";
 
 const client = new Client({
     token: process.env.FLUXER_BOT_TOKEN,
-    // Request intents and partials so reaction events and uncached messages are available.
-    // `intents` number is a broad mask to include message and reaction events; adjust if you prefer explicit flags.
-    intents: 32767,
-    partials: ["MESSAGE", "CHANNEL", "REACTION"],
 });
 
 let logChannel = null;
