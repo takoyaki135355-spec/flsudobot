@@ -26,4 +26,5 @@ V2.5.0
 ## Patch Notes
 
 2.5.0   Integrated Poll Feature
+
 2.4.10  Integrated Artificial Intellegence
