@@ -128,9 +128,22 @@ client.on("ready", async () => {
 client.on("messageCreate", async (message) => {
     const content = message.content || "";
     
-    if (message.author.id === client.user.id) return;
+    if (client.user && message.author && message.author.id === client.user.id) return;
     
     const channelId = message.channel?.id || message.channelId;
+
+    // Auto-reply when a message contains the word 'gnu' (case-insensitive)
+    try {
+        if (/\bgnu\b/i.test(content)) {
+            const gnuReply = '```Judge: "Court is now in session. First order of business: why is there a wildebeest in my courtroom?"\n\nBailiff: "You approved the GNU permit, Your Honor."\n\nJudge: "I don\'t remember doing that."\n\nBailiff: "You signed it in crayon."\n\nWitness Cat: "mrrp."\n\nTraining Ass™: "Can we address the fact that I keep being dragged into these proceedings against my will?"\n\nGNU: "Moo?"\n\nJudge: "Objection."\n\nBailiff: "You can\'t object to your own courtroom."\n\nJudge: "Then I overrule myself."\n\nWitness Cat: "mrrp."\n\nCourt Reporter: "Let the record show that the cat appears to be the only competent individual present."\n\nJudge: "Excellent. I appoint the cat as temporary legal advisor."\n\nWitness Cat: falls asleep on the evidence table\n\nVERDICT:\n\nGNU: Released on probation.\nTraining Ass™: Awarded paid leave.\nJudge: Required to retake Courtroom Management 101.\nBailiff: Updating their résumé.\nCat: Accidentally promoted again.```';
+
+            await message.reply(gnuReply);
+            console.log(`[AUTO → ${channelId}] GNU auto-reply sent`);
+            // continue processing other handlers if desired
+        }
+    } catch (e) {
+        console.error('Failed sending GNU auto-reply:', e);
+    }
 
     // Helpers: detect category-like channels and produce a friendly display name
     function isCategoryChannel(ch) {
@@ -342,7 +355,7 @@ client.on("messageCreate", async (message) => {
                     if (typeof channel.send !== "function") continue;
 
                     let canSend = true;
-                    if (channel.permissionsFor) {
+                    if (channel.permissionsFor && client.user) {
                         try {
                             const perms = channel.permissionsFor(client.user);
                             if (perms) {
