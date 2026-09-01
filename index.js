@@ -3,6 +3,12 @@ import { Client } from "@fluxerjs/core";
 import fs from "fs";
 import path from "path";
 
+if (!process.env.FLUXER_BOT_TOKEN) {
+    console.error("Error: FLUXER_BOT_TOKEN is missing or not set in .env.");
+    console.error("Please make sure you are running 'node index.js' from the project directory containing .env.");
+    process.exit(1);
+}
+
 const client = new Client({
     token: process.env.FLUXER_BOT_TOKEN,
 });
